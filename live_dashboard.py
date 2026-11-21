@@ -25,6 +25,7 @@ METRICS = {"comparison", "precontact_update", "remaining"}
 DOOR_COLOR = "#b75c1e"
 AVOID_COLOR = "#764889"
 FLIGHT_COLOR = "#166b7f"
+TRAJECTORY_COLOR = "#218148"
 MUTED = "#566d7a"
 
 
@@ -85,7 +86,8 @@ class Dashboard:
 
         legend = ttk.Frame(self.root, padding=(0, 4, 0, 6))
         legend.pack(fill="x")
-        for label, color in (("已飞轨迹", FLIGHT_COLOR), ("经门候选", DOOR_COLOR),
+        for label, color in (("已飞轨迹", FLIGHT_COLOR), ("局部优化轨迹", TRAJECTORY_COLOR),
+                             ("经门候选", DOOR_COLOR),
                              ("绕行候选", AVOID_COLOR), ("门扇估计", "#555a35"),
                              ("空心点：比较起点", MUTED)):
             ttk.Label(legend, foreground=color, text=label, padding=(0, 0, 18, 0)).pack(side="left")
@@ -148,7 +150,7 @@ class Dashboard:
             self.canvas.create_line(*[value for point in path for value in self.xy(point)],
                                     fill=color, width=width, dash=dash)
 
-    def _draw_map(self, position, target, nav, snapshot):
+    def _draw_map(self, position, target, nav, snapshot, trajectory=None):
         self.map_size = (max(100, self.canvas.winfo_width()), max(100, self.canvas.winfo_height()))
         self.canvas.delete("all")
         for gate in self.arena.gates:
@@ -168,16 +170,20 @@ class Dashboard:
                 self._line((leaf.hinge, tip), "#555a35", 3, () if len(leaves) == 1 else (3, 2))
         self._line(self.path, FLIGHT_COLOR, 2)
         choices = (("door", DOOR_COLOR), ("avoid", AVOID_COLOR))
-        if snapshot and snapshot.get("decision_position"):
+        decision_position = snapshot.get("decision_position") if snapshot else None
+        if decision_position is not None:
             selected = "avoid" if snapshot.get("selected") in ("bypass", "retreat") else "door"
             for option, color in sorted(choices, key=lambda pair: pair[0] == selected):
                 chosen = option == selected
                 self._line(snapshot.get(option+"_route", ()), color, 3 if chosen else 2,
                            () if chosen else (5, 3))
-            x, y = self.xy(snapshot["decision_position"])
-            self.canvas.create_oval(x-4, y-4, x+4, y+4, outline=MUTED, width=1)
         else:
             self._line(nav.route, "#98a8af", 2, (4, 3))
+        if trajectory is not None:
+            self._line(trajectory, TRAJECTORY_COLOR, 2, (2, 2))
+        if decision_position is not None:
+            x, y = self.xy(decision_position)
+            self.canvas.create_oval(x-4, y-4, x+4, y+4, outline=MUTED, width=1)
         for point, color, radius in ((target, DOOR_COLOR, 3), (position, FLIGHT_COLOR, 5),
                                      (self.arena.goal, "#488051", 4)):
             x, y = self.xy(point)
@@ -185,7 +191,9 @@ class Dashboard:
 
     def _update_events(self, events):
         for event in events[self.event_index:]:
-            name, kind = event["door"], event["event"]
+            name, kind = event.get("door"), event["event"]
+            if name not in self.history:
+                continue
             if kind in METRICS:
                 self.focus = name
                 self.history[name].append(event)
@@ -259,7 +267,7 @@ class Dashboard:
             if len(coordinates) > 1:
                 self.trend.create_line(*[v for p in coordinates for v in p], fill=color, width=2)
 
-    def update(self, t, position, target, nav, *, force=False):
+    def update(self, t, position, target, nav, *, force=False, trajectory=None, trajectory_status=""):
         if self.closed or (t < self.next_draw and not force):
             return
         self.next_draw = t+.10
@@ -268,7 +276,7 @@ class Dashboard:
         history = self.history.get(self.focus, ())
         snapshot = history[-1] if history else {}
         self._show_decision(snapshot, self.outcomes.get(self.focus))
-        self._draw_map(position, target, nav, snapshot)
+        self._draw_map(position, target, nav, snapshot, trajectory)
         self._draw_trend()
         status = f"仿真 {t:.1f} s   ·   执行中  {PHASES.get(nav.phase, nav.phase)}"
         if nav.attempt:
@@ -280,6 +288,8 @@ class Dashboard:
             status += f"   ·   施力目标 {nav.trial.target:.2f} N"
             if nav.trial.output_limited:
                 status += "   ·   控制输出限幅"
+        if trajectory_status:
+            status += f"   ·   {trajectory_status}"
         self.state.set(status)
         self.pump()
 

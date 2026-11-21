@@ -65,7 +65,7 @@ def make_scene():
     # The navigator receives only the coarse map. The last four columns are
     # scene parameters (initial angle, hinge side, profile and display name).
     cases = (
-        ('D1', 1.90, 3.40,  7.,  1, 'easy', 'short detour'),
+        ('D1', 4.90, 6.40,  7.,  1, 'easy', 'door shortcut'),
         ('D2', -5.30, -3.80, 78., -1, 'easy', 'open door'),
         ('D3', 7.00, 8.60, 25.,  1, 'easy', 'weak door returns'),
         ('D4', -6.95, -5.45, 15., -1, 'effort_ramp', 'rising effort'),

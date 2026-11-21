@@ -15,11 +15,16 @@ class Localization:
         self.wall_segments = arena.walls if hasattr(arena, "bounds") else None
         self.hits = 0
 
-    def predict(self, acc, gyro, dt):
+    def predict(self, acc, gyro, dt, *, near_hover):
         rotation = self.rotation
-        # Trust the gravity direction during low-specific-force motion.
-        gravity_error = np.cross(acc / max(np.linalg.norm(acc), .01), rotation[2])
-        rate = gyro + .10 * gravity_error
+        # Under commanded acceleration, the accelerometer also sees vehicle
+        # motion. Using it as gravity tilts the estimate and biases dead reckoning.
+        rate = gyro
+        if near_hover and np.linalg.norm(self.velocity[:2]) < .18:
+            magnitude = np.linalg.norm(acc)
+            if abs(magnitude-9.81) < .35:
+                gravity_error = np.cross(acc / magnitude, rotation[2])
+                rate = gyro + .10 * gravity_error
         axis = rate * dt
         x, y, z = axis
         skew = np.array([[0., -z, y], [z, 0., -x], [-y, x, 0.]])
