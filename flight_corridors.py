@@ -43,6 +43,14 @@ def _obstacles(arena, leaves):
                        np.asarray(half_extents).reshape(-1, 2))
 
 
+def sampled_clearance(points, arena, leaves):
+    """Smallest cage clearance at supplied points, for ranking certified curves."""
+    rectangles = _obstacles(arena, leaves)
+    local = np.einsum("nij,tnj->tni", rectangles.axes, points[:, None]-rectangles.centers)
+    outside = np.maximum(abs(local)-rectangles.half_extents, 0.)
+    return float(np.linalg.norm(outside, axis=-1).min()) - CAGE_RADIUS
+
+
 def _closest_segment(start, finish, rectangles):
     """Return distance and the local displacement from each box to the segment."""
     local = np.einsum("nij,nj->ni", rectangles.axes, start - rectangles.centers)

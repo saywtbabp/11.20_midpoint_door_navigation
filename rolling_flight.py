@@ -4,7 +4,7 @@ from time import perf_counter
 
 import numpy as np
 
-from flight_corridors import FLIGHT_MARGIN, build_corridors, certify_controls
+from flight_corridors import FLIGHT_MARGIN, build_corridors, certify_controls, sampled_clearance
 from minimum_snap import solve_minimum_snap
 from simulator import MIXER
 
@@ -16,10 +16,15 @@ WINDOW_M = 10.
 REFRESH_S = .85
 RETRY_S = .25
 TRACK_ERROR_M = .17
+HANDOFF_VELOCITY_ERROR_MPS = .25
 MAX_ACCEL = 1.85
 MAX_JERK = 6.
 SPEEDS = {"fly": 1.50, "approach": .78, "bypass": 1.30, "cross": 1.20,
           "release": 1.02, "retreat": .68}
+BYPASS_OUTLET_OFFSETS = ((.15, 0.), (.30, 0.), (.15, -.08))
+MAX_HANDOFF_CANDIDATES = 6
+HANDOFF_COMPARISON_BUDGET_S = .035
+WALL_VELOCITY_WEIGHT = .25
 
 
 def _right_controls(control, u):
@@ -40,6 +45,7 @@ class ScheduledFlight:
     seamless: tuple
     extend: bool
     braking: bool = False
+    route_margin: float = ROUTE_LATERAL_M
 
     def reference(self, t):
         return self.curve.sample(t-self.start)
@@ -54,11 +60,12 @@ class ScheduledFlight:
         return (controls[-1][-1:],)
 
 
-def _window(position, waypoints):
+def _window(position, waypoints, *, include_bypass_exit=False):
     points = [np.asarray(position)]
     remaining = WINDOW_M
     extend = False
     for waypoint in waypoints:
+        waypoint = np.asarray(waypoint)
         length = float(np.linalg.norm(waypoint-points[-1]))
         if length < .025 and len(points) > 1:
             continue
@@ -70,16 +77,17 @@ def _window(position, waypoints):
             break
         points.append(waypoint)
         remaining -= length
-        if remaining < .10 or len(points) == 4:
+        if remaining < .10 or len(points) == (5 if include_bypass_exit else 4):
             extend = float(np.linalg.norm(points[-1]-waypoints[-1])) > .025
             break
     return np.asarray(points), extend
 
 
 class RollingFlight:
-    def __init__(self, arena, mass):
+    def __init__(self, arena, mass, *, wall_smoothing=False):
         self.arena = arena
         self.mass = mass
+        self.wall_smoothing = wall_smoothing
         self.active = None
         self.leaves_key = None
         self.next_attempt = 0.
@@ -92,6 +100,12 @@ class RollingFlight:
         self.invalidations = 0
         self.failures = 0
         self.brakes = 0
+        self.handoff_rejections = 0
+        self.outlet_adjustments = 0
+        self.handoff_adjustments = {}
+        self.handoff_comparisons = {}
+        self.handoff_budget_limits = 0
+        self.outlet_checked_revision = None
         self.solve_ms = []
         self.preview = ()
 
@@ -102,7 +116,45 @@ class RollingFlight:
         rate_reserve = np.abs(MIXER[:, 1:]) @ (np.array([.16, .16, .09])*jerk/9.81)
         return float(np.max(MIXER[:, 0]*collective + rate_reserve))
 
-    def _solve(self, points, velocity, acceleration, leaves, speed, *, lateral_margin=ROUTE_LATERAL_M):
+    def _dynamic_scales(self, bounds, speed, acceleration_limit):
+        vmax, amax, jmax = bounds.T
+        scales = np.maximum.reduce((vmax/speed, np.sqrt(amax/acceleration_limit),
+                                    np.cbrt(jmax/MAX_JERK)))
+        for index, (_, accel, jerk) in enumerate(bounds):
+            if self._nominal_motor_peak(accel, jerk) > 9.0:
+                scales[index] = max(scales[index], 1.16)
+        return scales
+
+    def _recover_segment_time(self, curve, points, velocity, acceleration, corridors,
+                              lengths, initial_durations, speed, acceleration_limit):
+        # Try shortening only inflated long legs with spare dynamic margin.
+        # Each attempt re-solves the coupled curve and rechecks every segment.
+        segments = np.diff(points, axis=0)
+        along_wall = abs(segments[:, 0]) <= .30*abs(segments[:, 1])
+        minimum_durations = np.maximum(initial_durations, .80*curve.durations)
+        for _ in range(3):
+            scales = self._dynamic_scales(curve.segment_derivative_bounds(), speed, acceleration_limit)
+            spare = curve.durations - minimum_durations
+            eligible = along_wall & (lengths >= 3.) & (spare >= .15) & (scales < .92)
+            if not np.any(eligible):
+                break
+            segment = int(np.argmax(np.where(eligible, spare, -1.)))
+            durations = curve.durations.copy()
+            reduction = min(spare[segment], durations[segment]*.12)
+            for factor in (1., .5):
+                durations[segment] = curve.durations[segment] - factor*reduction
+                trial = solve_minimum_snap(points, durations, velocity, acceleration, corridors,
+                                           regularize_progress=True)
+                if trial is not None and np.all(self._dynamic_scales(
+                        trial.segment_derivative_bounds(), speed, acceleration_limit) <= 1.001):
+                    curve = trial
+                    break
+            else:
+                break
+        return curve
+
+    def _solve(self, points, velocity, acceleration, leaves, speed, *, lateral_margin=ROUTE_LATERAL_M,
+               segment_timing=False, wall_shape=False):
         corridors = build_corridors(points, self.arena, leaves, margin=FLIGHT_MARGIN)
         if corridors is None:
             return None, "corridor"
@@ -120,18 +172,37 @@ class RollingFlight:
             corridors[index] = np.vstack((a, directions)), np.r_[b, bounds]
         speed = max(speed, float(np.linalg.norm(velocity))*1.05)
         acceleration_limit = max(MAX_ACCEL, float(np.linalg.norm(acceleration))*1.05)
-        durations = np.maximum(.55, 1.5*lengths/speed)
-        for _ in range(6):
-            curve = solve_minimum_snap(points, durations, velocity, acceleration, corridors)
-            if curve is None:
-                return None, "boundary"
-            vmax, amax, jmax = curve.derivative_bounds()
-            scale = max(vmax/speed, np.sqrt(amax/acceleration_limit), np.cbrt(jmax/MAX_JERK))
-            if self._nominal_motor_peak(amax, jmax) > 9.0:
-                scale = max(scale, 1.16)
-            if scale <= 1.001:
-                return curve, ""
-            durations *= max(1.06, 1.035*scale)
+        initial_durations = np.maximum(.55, 1.5*lengths/speed)
+        for per_segment in ((True, False) if segment_timing and len(lengths) > 1 else (False,)):
+            durations = initial_durations.copy()
+            for _ in range(6):
+                curve = solve_minimum_snap(points, durations, velocity, acceleration, corridors,
+                                           regularize_progress=per_segment)
+                if curve is None:
+                    if not per_segment:
+                        return None, "boundary"
+                    break
+                bounds = curve.segment_derivative_bounds()
+                if not per_segment:
+                    bounds = bounds.max(axis=0, keepdims=True)
+                scales = self._dynamic_scales(bounds, speed, acceleration_limit)
+                exceeded = scales > 1.001
+                if not np.any(exceeded):
+                    if per_segment:
+                        curve = self._recover_segment_time(curve, points, velocity, acceleration, corridors,
+                                                           lengths, initial_durations, speed, acceleration_limit)
+                    if (self.wall_smoothing and wall_shape and np.any(
+                            (abs(segments[:, 1]) >= 2.5) & (abs(segments[:, 0]) <= .30*abs(segments[:, 1])))
+                            and self._wall_sway(curve) >= .025):
+                        trial = solve_minimum_snap(points, curve.durations, velocity, acceleration, corridors,
+                                                   regularize_progress=per_segment,
+                                                   wall_velocity_weight=WALL_VELOCITY_WEIGHT)
+                        if trial is not None and self._prefer_wall_shape(curve, trial, leaves, speed,
+                                                                         acceleration_limit):
+                            curve = trial
+                    return curve, ""
+                # Each re-solve couples neighboring segments through the knot derivatives.
+                durations *= np.where(exceeded, np.maximum(1.06, 1.035*scales), 1.)
         return None, "dynamic"
 
     def _brake(self, t, position, velocity, acceleration, revision, leaves):
@@ -171,13 +242,226 @@ class RollingFlight:
             return self.hold, np.zeros(2), np.zeros(2), np.zeros(2)
         return None
 
+    @staticmethod
+    def _geometry_key(leaves):
+        return tuple((leaf.gate.name, leaf.side, round(leaf.angle, 6)) for leaf in leaves)
+
+    def _plan(self, t, position, velocity, acceleration, revision, waypoints, phase, leaves, *,
+              old, same_path=False, recovering=False, retreat_bypass=False):
+        started = perf_counter()
+        previous = old.reference(t) if old is not None and not old.braking else None
+        use_previous = previous is not None and np.linalg.norm(position-previous[0]) < .09
+        if use_previous and not same_path:
+            use_previous = (np.linalg.norm(velocity-previous[1]) <= HANDOFF_VELOCITY_ERROR_MPS
+                            and certify_controls(np.vstack((position, previous[0])), self.arena,
+                                                 leaves, margin=FLIGHT_MARGIN))
+        initial_acceleration = np.clip(acceleration, -.45, .45) if recovering else acceleration
+        state = previous[:3] if use_previous else (position, velocity, initial_acceleration)
+        points, extend = _window(state[0], waypoints, include_bypass_exit=retreat_bypass)
+        moving_handoff = (use_previous and not same_path
+                          and (phase == "cross" or (phase == "approach" and len(points) == 2)))
+        lateral_margin = HANDOFF_LATERAL_M if moving_handoff else ROUTE_LATERAL_M
+        curve, why = (self._solve(points, state[1], state[2], leaves, SPEEDS[phase],
+                                  lateral_margin=lateral_margin, segment_timing=retreat_bypass,
+                                  wall_shape=phase == "bypass")
+                      if len(points) > 1 else (None, "at_target"))
+        if curve is None and use_previous and why != "at_target":
+            points, extend = _window(position, waypoints, include_bypass_exit=retreat_bypass)
+            if len(points) > 1:
+                curve, why = self._solve(points, velocity, acceleration, leaves, SPEEDS[phase],
+                                         lateral_margin=lateral_margin, segment_timing=retreat_bypass,
+                                         wall_shape=phase == "bypass")
+        if curve is None and why == "boundary" and old is None and phase == "release":
+            lateral_margin = HANDOFF_LATERAL_M
+            curve, why = self._solve(points, velocity, initial_acceleration, leaves, SPEEDS[phase],
+                                     lateral_margin=lateral_margin)
+        self.solve_ms.append((perf_counter()-started)*1000.)
+        if curve is None:
+            return None, why
+        knots = np.cumsum(curve.durations)
+        seamless = tuple(zip(points[1:-1], knots[:-1]))
+        return ScheduledFlight(curve, t, revision, seamless, extend, route_margin=lateral_margin), ""
+
+    def _accept(self, scheduled):
+        self._set(scheduled, "tracking")
+        self.next_attempt = scheduled.start + .10
+        self.plans += 1
+
+    @staticmethod
+    def _wall_sway(curve):
+        sway = 0.
+        knots = np.r_[0., np.cumsum(curve.durations)]
+        for control, start, end in zip(curve.control_points, knots, knots[1:]):
+            dx, dy = control[-1]-control[0]
+            if abs(dy) >= 2. and abs(dx) <= .30*abs(dy):
+                x = [curve.sample(t)[0][0] for t in np.linspace(start, end, 25)]
+                sway += np.abs(np.diff(x)).sum()-abs(dx)
+        return sway
+
+    def _trajectory_metrics(self, curve, phase, leaves, *, sample_count=121):
+        samples = np.array([curve.sample(t)[:3] for t in np.linspace(0., curve.duration, sample_count)])
+        position, velocity, acceleration = samples.transpose(1, 0, 2)
+        speed = np.linalg.norm(velocity, axis=1)
+        cross = abs(velocity[:, 0]*acceleration[:, 1]-velocity[:, 1]*acceleration[:, 0])
+        peak_turn_rate = float((cross/np.maximum(speed, .30)**2).max())
+        knots = np.r_[0., np.cumsum(curve.durations)]
+        alignment = 0.
+        for index, knot in enumerate(knots[1:-1], start=1):
+            p, v, _, _ = curve.sample(knot)
+            onward = curve.control_points[index, -1]-p
+            magnitude = np.linalg.norm(v)*np.linalg.norm(onward)
+            if np.linalg.norm(v) > .30 and magnitude > 1e-6:
+                alignment += 1.-float(np.clip((v @ onward)/magnitude, -1., 1.))
+        sway = self._wall_sway(curve) if phase == "bypass" else 0.
+        score = curve.duration + .8*peak_turn_rate + 3.*sway + .15*alignment
+        return score, sampled_clearance(position, self.arena, leaves), peak_turn_rate, sway
+
+    def _prefer_wall_shape(self, original, trial, leaves, speed, acceleration_limit):
+        bounds = trial.segment_derivative_bounds()
+        if np.any(self._dynamic_scales(bounds, speed, acceleration_limit) > 1.001):
+            return False
+        _, clearance, turn, sway = self._trajectory_metrics(original, "bypass", leaves, sample_count=61)
+        _, trial_clearance, trial_turn, trial_sway = self._trajectory_metrics(trial, "bypass", leaves, sample_count=61)
+        return (trial_sway < sway-.015 and trial_turn <= turn*1.10+.03
+                and trial_clearance >= clearance-.01
+                and bounds[:, 2].max() <= original.derivative_bounds()[2]*1.10+.10)
+
+    def _compare_handoff(self, scheduled, waypoints, alternatives, phase, leaves, *, retreat_bypass=False):
+        """Compare complete executable curves from the same state to the same stop."""
+        if not alternatives:
+            return scheduled, waypoints
+        self.handoff_comparisons[phase] = self.handoff_comparisons.get(phase, 0)+1
+        started = perf_counter()
+        position, velocity, acceleration, _ = scheduled.curve.sample(0.)
+        finish = scheduled.curve.sample(scheduled.curve.duration)[0]
+        # When the horizon clips the route, only move knots already inside it.
+        used = []
+        if scheduled.extend:
+            first = 0
+            for point, _ in scheduled.seamless:
+                index = next((i for i in range(first, len(waypoints))
+                              if np.linalg.norm(point-waypoints[i]) < .015), None)
+                if index is None:
+                    return scheduled, waypoints
+                used.append(index)
+                first = index+1
+        best, selected = scheduled, waypoints
+        best_score, clearance, turn_rate, sway = self._trajectory_metrics(scheduled.curve, phase, leaves)
+        for candidate in alternatives:
+            if perf_counter()-started >= HANDOFF_COMPARISON_BUDGET_S:
+                self.handoff_budget_limits += 1
+                break
+            if scheduled.extend:
+                if (len(candidate) != len(waypoints)
+                        or any(np.linalg.norm(np.asarray(a)-b) > .01 for i, (a, b) in
+                               enumerate(zip(candidate, waypoints)) if i not in used)):
+                    continue
+                inner = [candidate[i] for i in used]
+            else:
+                if np.linalg.norm(finish-candidate[-1]) > .015:
+                    continue
+                inner = candidate[:-1]
+            points = np.asarray((position, *inner, finish))
+            if np.any(np.linalg.norm(np.diff(points, axis=0), axis=1) < .025):
+                continue
+            curve, _ = self._solve(points, velocity, acceleration, leaves, SPEEDS[phase],
+                                   lateral_margin=scheduled.route_margin, segment_timing=retreat_bypass)
+            if curve is None:
+                continue
+            score, trial_clearance, trial_turn, trial_sway = self._trajectory_metrics(curve, phase, leaves)
+            if (trial_clearance < clearance-.025 or trial_turn > turn_rate*1.10
+                    or trial_sway > sway+.04 or score >= best_score-.08):
+                continue
+            knots = np.cumsum(curve.durations)
+            best = ScheduledFlight(curve, scheduled.start, scheduled.revision,
+                                   tuple(zip(points[1:-1], knots[:-1])), scheduled.extend,
+                                   route_margin=scheduled.route_margin)
+            selected, best_score = candidate, score
+        self.solve_ms[-1] += (perf_counter()-started)*1000.
+        if best is not scheduled:
+            self.handoff_adjustments[phase] = self.handoff_adjustments.get(phase, 0)+1
+        return best, selected
+
+    def _bypass_metrics(self, curve, gate, leaves):
+        samples = np.array([curve.sample(t)[:3] for t in np.linspace(0., curve.duration, 161)])
+        position, velocity, acceleration = samples.transpose(1, 0, 2)
+        local = ((abs(position[:, 1]-gate.bypass_middle) < 2.)
+                 & (gate.x-1.35 < position[:, 0]) & (position[:, 0] < gate.x+2.))
+        speed = np.linalg.norm(velocity, axis=1)
+        turning = local & (speed > .30)
+        curvature = abs(velocity[:, 0]*acceleration[:, 1]-velocity[:, 1]*acceleration[:, 0])
+        curvature /= np.maximum(speed, .30)**3
+        peak = float(curvature[turning].max(initial=0.))
+        exit_peak = float(curvature[turning & (position[:, 0] >= gate.x)].max(initial=0.))
+        clearance = sampled_clearance(position[local], self.arena, leaves) if np.any(local) else 0.
+        return peak, exit_peak, clearance
+
+    def _choose_bypass_outlet(self, scheduled, waypoints, outlet, gate, leaves):
+        position, velocity, acceleration, _ = scheduled.curve.sample(0.)
+        finish = scheduled.curve.sample(scheduled.curve.duration)[0]
+        points = np.vstack((position, *(point for point, _ in scheduled.seamless), finish))
+        matches = np.flatnonzero(np.linalg.norm(points[1:-1]-waypoints[outlet], axis=1) < .015)
+        if not len(matches):
+            return scheduled
+
+        index = int(matches[0])+1
+        outbound_side = np.sign(waypoints[-1][1]-gate.bypass_middle)
+        peak, exit_peak, clearance = self._bypass_metrics(scheduled.curve, gate, leaves)
+        best_score = .7*peak + .3*exit_peak + .12*scheduled.curve.duration
+        best, best_point = scheduled, None
+        for forward, lateral in BYPASS_OUTLET_OFFSETS:
+            trial_points = points.copy()
+            trial_points[index] += (forward, lateral*outbound_side)
+            curve, _ = self._solve(trial_points, velocity, acceleration, leaves, SPEEDS["bypass"],
+                                   segment_timing=True)
+            if curve is None:
+                continue
+            trial_peak, trial_exit, trial_clearance = self._bypass_metrics(curve, gate, leaves)
+            score = .7*trial_peak + .3*trial_exit + .12*curve.duration
+            if trial_clearance < clearance-.025 or trial_peak > peak*1.10 or score >= best_score-.03:
+                continue
+            knots = np.cumsum(curve.durations)
+            best = ScheduledFlight(curve, scheduled.start, scheduled.revision,
+                                   tuple(zip(trial_points[1:-1], knots[:-1])), scheduled.extend)
+            best_score, best_point = score, trial_points[index].copy()
+        if best_point is not None:
+            waypoints[outlet] = best_point
+            self.outlet_adjustments += 1
+        return best
+
+    def try_handoff(self, t, position, velocity, acceleration, revision, waypoints, phase, leaves, *,
+                    retreat_bypass=False, alternatives=()):
+        """Install a certified candidate only when it can replace the current flight."""
+        old = self.active
+        key = self._geometry_key(leaves)
+        if old is not None and key != self.leaves_key and not all(
+                certify_controls(piece, self.arena, leaves, margin=FLIGHT_MARGIN)
+                for piece in old.remaining(t)):
+            old = None
+        candidates = (tuple(waypoints), *alternatives[:MAX_HANDOFF_CANDIDATES-1])
+        for index, route in enumerate(candidates):
+            scheduled, _ = self._plan(t, position, velocity, acceleration, revision, route, phase, leaves,
+                                      old=old, retreat_bypass=retreat_bypass)
+            if scheduled is not None:
+                break
+        else:
+            self.handoff_rejections += 1
+            return False
+        scheduled, selected = self._compare_handoff(scheduled, route, candidates[index+1:], phase, leaves,
+                                                    retreat_bypass=retreat_bypass)
+        if isinstance(waypoints, list):
+            waypoints[:] = selected
+        self.leaves_key = key
+        self._accept(scheduled)
+        return True
+
     def update(self, t, position, velocity, acceleration, revision, waypoints, phase, leaves, *,
-               separating=False):
+               separating=False, retreat_bypass=False, bypass_outlet=None, release_alternatives=()):
         if phase not in FLIGHT_PHASES or not waypoints:
             self._set(None, "inactive")
             return
         leaves = tuple(leaves)
-        key = tuple((leaf.gate.name, leaf.side, round(leaf.angle, 6)) for leaf in leaves)
+        key = self._geometry_key(leaves)
         old = self.active
         if old is not None and key != self.leaves_key:
             self.rechecks += 1
@@ -194,8 +478,12 @@ class RollingFlight:
         time_left = old.start + old.curve.duration - t if old is not None else 0.
         extension = (same_path and old.extend
                      and time_left < max(REFRESH_S, .45*old.curve.duration))
+        check_outlet = (same_path and bypass_outlet is not None and not old.braking
+                        and self.outlet_checked_revision != revision
+                        and abs(position[1]-bypass_outlet[1].bypass_middle) <= 3.2
+                        and position[0] < bypass_outlet[1].x)
         retry_after_brake = old is not None and old.braking and time_left <= .01
-        if same_path and not extension and not retry_after_brake and error < TRACK_ERROR_M:
+        if same_path and not extension and not retry_after_brake and not check_outlet and error < TRACK_ERROR_M:
             return
         if t < self.next_attempt and (old is None or same_path):
             return
@@ -210,35 +498,31 @@ class RollingFlight:
             self._set(None, "separating")
             return
 
-        started = perf_counter()
-        use_previous = previous is not None and error < .09 and not old.braking
-        initial_acceleration = np.clip(acceleration, -.45, .45) if recovering else acceleration
-        state = previous[:3] if use_previous else (position, velocity, initial_acceleration)
-        points, extend = _window(state[0], waypoints)
-        # Let a moving approach turn gradually from the incoming tangent while
-        # keeping the wall and leaf half-spaces in the corridor.
-        lateral_margin = (HANDOFF_LATERAL_M if phase == "approach" and use_previous
-                          and not same_path and len(points) == 2 else ROUTE_LATERAL_M)
-        curve, why = (self._solve(points, state[1], state[2], leaves, SPEEDS[phase],
-                                  lateral_margin=lateral_margin)
-                      if len(points) > 1 else (None, "at_target"))
-        if curve is None and use_previous and why != "at_target":
-            points, extend = _window(position, waypoints)
-            if len(points) > 1:
-                curve, why = self._solve(points, velocity, acceleration, leaves, SPEEDS[phase],
-                                         lateral_margin=lateral_margin)
-        if curve is None and why == "boundary" and old is None and phase == "release":
-            # The residual motion after contact can need extra room to turn.
-            # Retry the route-band constraint before resorting to a brake.
-            curve, why = self._solve(points, velocity, initial_acceleration, leaves, SPEEDS[phase],
-                                     lateral_margin=HANDOFF_LATERAL_M)
-        self.solve_ms.append((perf_counter()-started)*1000.)
-        if curve is not None:
-            knots = np.cumsum(curve.durations)
-            seamless = tuple(zip(points[1:-1], knots[:-1]))
-            self._set(ScheduledFlight(curve, t, revision, seamless, extend), "tracking")
-            self.next_attempt = t + .10
-            self.plans += 1
+        scheduled, why = self._plan(t, position, velocity, acceleration, revision, waypoints, phase, leaves,
+                                    old=old, same_path=same_path, recovering=recovering,
+                                    retreat_bypass=retreat_bypass)
+        if scheduled is None and old is None:
+            for candidate in release_alternatives:
+                scheduled, _ = self._plan(t, position, velocity, acceleration, revision, candidate,
+                                          phase, leaves, old=None, recovering=recovering)
+                if scheduled is not None:
+                    waypoints[:] = candidate
+                    release_alternatives = ()
+                    break
+        if scheduled is not None:
+            if old is None and release_alternatives:
+                scheduled, selected = self._compare_handoff(scheduled, waypoints, release_alternatives,
+                                                            phase, leaves)
+                waypoints[:] = selected
+            if check_outlet:
+                self.outlet_checked_revision = revision
+                started = perf_counter()
+                chosen = self._choose_bypass_outlet(scheduled, waypoints, *bypass_outlet, leaves)
+                self.solve_ms[-1] += (perf_counter()-started)*1000.
+                if chosen is scheduled and not extension and error < TRACK_ERROR_M:
+                    return
+                scheduled = chosen
+            self._accept(scheduled)
             self.extensions += int(extension)
             return
 
@@ -259,5 +543,10 @@ class RollingFlight:
     def diagnostics(self):
         return dict(plans=self.plans, horizon_extensions=self.extensions, geometry_rechecks=self.rechecks,
                     invalidations=self.invalidations, solve_failures=self.failures, brakes=self.brakes,
+                    handoff_rejections=self.handoff_rejections,
+                    outlet_adjustments=self.outlet_adjustments,
+                    handoff_adjustments=dict(self.handoff_adjustments),
+                    handoff_comparisons=dict(self.handoff_comparisons),
+                    handoff_budget_limits=self.handoff_budget_limits,
                     median_solve_ms=round(float(np.median(self.solve_ms)), 3) if self.solve_ms else None,
                     max_solve_ms=round(max(self.solve_ms), 3) if self.solve_ms else None)

@@ -16,6 +16,14 @@ _POWERS = tuple(np.arange(n+1) for n in range(_DEGREE+1))
 _SNAP_GRAM = np.array([[comb(3, i)*comb(3, j)/(7*comb(6, i+j))
                         for i in range(4)] for j in range(4)])
 _SNAP_FACTOR = np.linalg.cholesky(_SNAP_GRAM).T
+# The bypass window includes the outbound leg. A light progress penalty lets
+# the optimizer distribute the turn between the incoming and outgoing legs.
+_PROGRESS_WEIGHT = .15
+_PROGRESS_SAMPLES = np.array((.25, .5, .75))[:, None]
+_PROGRESS_BASIS = (_BINOMIAL[7] * _PROGRESS_SAMPLES**_POWERS[7]
+                   * (1.-_PROGRESS_SAMPLES)**_POWERS[7][::-1])
+_VELOCITY_BASIS = 7.*(_BINOMIAL[6] * _PROGRESS_SAMPLES**_POWERS[6]
+                      * (1.-_PROGRESS_SAMPLES)**_POWERS[6][::-1])
 
 
 def _split_half(polygon):
@@ -77,8 +85,14 @@ class MinimumSnapTrajectory:
 
         Subdivision tightens the convex-hull bound without sampling the curve.
         """
-        return tuple(float(np.linalg.norm(_SUBDIVISION[degree] @ value, axis=-1).max())
-                     for degree, value in zip((6, 5, 4), self._derivatives[1:]))
+        return tuple(map(float, self.segment_derivative_bounds().max(axis=0)))
+
+    def segment_derivative_bounds(self) -> np.ndarray:
+        """Return one row of speed, acceleration and jerk bounds per segment."""
+        return np.column_stack([
+            np.linalg.norm(_SUBDIVISION[degree] @ value, axis=-1).max(axis=1)
+            for degree, value in zip((6, 5, 4), self._derivatives[1:])
+        ])
 
 
 def _control_map(points, durations, velocity, acceleration, corridors):
@@ -149,7 +163,7 @@ def _bounded_least_squares(target, normals, offsets):
 
 
 def solve_minimum_snap(points, durations, start_velocity, start_acceleration,
-                       corridors) -> MinimumSnapTrajectory | None:
+                       corridors, *, regularize_progress=False, wall_velocity_weight=0.) -> MinimumSnapTrajectory | None:
     """Fit all waypoints with shared physical derivatives up to jerk.
 
     Segment i must stay in its convex corridor A_i @ p <= b_i. The Bernstein
@@ -188,22 +202,53 @@ def solve_minimum_snap(points, durations, start_velocity, start_acceleration,
     system = (weight[:, None, None]*(_SNAP_FACTOR @ np.diff(mapping, n=4, axis=1))).reshape(
         (-1, mapping.shape[-1]))
     known = (weight[:, None, None]*(_SNAP_FACTOR @ np.diff(controls, n=4, axis=1))).reshape((-1, 2))
+    if regularize_progress:
+        # A very long leg contributes little snap relative to short turns. Keep
+        # its intermediate positions near an even pace without fixing knot velocities.
+        expected = waypoints[:-1, None] + _PROGRESS_SAMPLES * np.diff(waypoints, axis=0)[:, None]
+        progress_map = (_PROGRESS_BASIS @ mapping).reshape((-1, mapping.shape[-1]))
+        progress_error = (_PROGRESS_BASIS @ controls-expected).reshape((-1, 2))
+        system = np.vstack((system, _PROGRESS_WEIGHT*progress_map))
+        known = np.vstack((known, _PROGRESS_WEIGHT*progress_error))
     col_scales = np.linalg.norm(system, axis=0)
     if np.any(col_scales == 0.) or not np.isfinite(system).all() or not np.isfinite(known).all():
         return None
     try:
         q, r = np.linalg.qr(system/col_scales)
         lift = np.linalg.solve(r, np.eye(len(r)))/col_scales[:, None]
+        target = -q.T @ known
+        shapes = mapping @ lift
+        if wall_velocity_weight:
+            dx, dy = np.diff(waypoints, axis=0).T
+            along_wall = (np.abs(dy) >= 2.5) & (np.abs(dx) <= .30*np.abs(dy))
+            if np.any(along_wall):
+                # Penalize deviations from the mean cross-wall velocity on long,
+                # wall-parallel legs while retaining the endpoint displacement.
+                wall_weight = wall_velocity_weight*np.sqrt(scale/times[along_wall])[:, None, None]
+                lateral_map = _VELOCITY_BASIS @ np.diff(mapping[along_wall], axis=1)
+                lateral_error = (_VELOCITY_BASIS @ np.diff(controls[along_wall, :, :1], axis=1)
+                                 - dx[along_wall, None, None])
+                sx = np.vstack((system, (wall_weight*lateral_map).reshape((-1, mapping.shape[-1]))))
+                kx = np.r_[known[:, 0], (wall_weight*lateral_error).ravel()]
+                x_scale = np.linalg.norm(sx, axis=0)
+                xq, xr = np.linalg.qr(sx/x_scale)
+                x_lift = np.linalg.solve(xr, np.eye(len(xr)))/x_scale[:, None]
+                target[:, 0] = -xq.T @ kx
+                x_shapes = mapping @ x_lift
+            else:
+                x_shapes = shapes
+        else:
+            x_shapes = shapes
     except np.linalg.LinAlgError:
         return None
 
     # In these coordinates the objective is squared distance to target.
-    target = (-q.T @ known).reshape(-1)
-    shapes = mapping @ lift
+    target = target.reshape(-1)
+    axis_shapes = np.stack((x_shapes, shapes), axis=-1)
     normals, offsets = [], []
-    for a_b, baseline, shape in zip(normalized, controls, shapes):
+    for a_b, baseline, shape in zip(normalized, controls, axis_shapes):
         a, b = a_b
-        normals.append(np.einsum("ki,md->kmid", shape, a).reshape((8*len(a), target.size)))
+        normals.append(np.einsum("kid,md->kmid", shape, a).reshape((8*len(a), target.size)))
         offsets.append((b-baseline @ a.T).reshape(-1))
     linear, bound = np.concatenate(normals), np.concatenate(offsets)
     lengths = np.linalg.norm(linear, axis=1)
@@ -212,7 +257,7 @@ def solve_minimum_snap(points, durations, start_velocity, start_acceleration,
     # at its boundary are treated as zero by the active-set iteration.
     updated = _bounded_least_squares(target, linear[variable]/lengths[variable, None],
                                      np.maximum(0., bound[variable])/lengths[variable])
-    candidate = controls+shapes @ updated.reshape((-1, 2))
+    candidate = controls+np.einsum("skid,id->skd", axis_shapes, updated.reshape((-1, 2)))
     if np.isfinite(candidate).all() and all(np.all(control @ a.T <= b+_POSITION_TOL)
                                          for control, (a, b) in zip(candidate, normalized)):
         controls = candidate

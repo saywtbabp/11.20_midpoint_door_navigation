@@ -30,6 +30,7 @@ from viewer_pause import ViewerPause
 SHOW_VIEWER = True
 SHOW_DASHBOARD = True
 USE_MINIMUM_SNAP = True
+WALL_SMOOTHING = False
 REALTIME_FACTOR = 1.0
 EFFORT_WEIGHT_M_PER_J = 1/.030
 PUSH_FORCE_RAMP_N_PER_S = 1.20
@@ -51,17 +52,76 @@ def _measured_clearance(sim, obstacle_ids):
     return float(np.min(np.linalg.norm(outside, axis=1))) - CAGE_RADIUS
 
 
+def _trajectory_quality(samples, planning_ms, arena):
+    """Summarize offline closed-loop samples and wall-clock planner latency."""
+    dt = DT*SCAN_STEPS
+    result = dict(planning_scan_p95_ms=round(float(np.percentile(planning_ms, 95)), 3) if planning_ms else None,
+                  planning_scan_max_ms=round(max(planning_ms), 3) if planning_ms else None,
+                  planning_scans_over_period=sum(ms > 1000.*dt for ms in planning_ms), bypass={})
+    if not samples:
+        return result
+    # Columns are time, truth x/y, clearance, truth tracking error, and reference jerk norm.
+    rows = np.asarray(samples)
+    times, positions = rows[:, 0], rows[:, 1:3]
+    reference = np.isfinite(rows[:, 4])
+    consecutive = np.diff(times) < dt*1.5
+    result.update(free_flight_truth_distance_m=round(float(np.linalg.norm(np.diff(positions, axis=0), axis=1)[consecutive].sum()), 4),
+                  free_flight_clearance_p05_m=round(float(np.percentile(rows[:, 3], 5)), 4),
+                  truth_tracking_p95_m=round(float(np.percentile(rows[reference, 4], 95)), 4)
+                  if np.any(reference) else None,
+                  reference_jerk_rms_mps3=round(float(np.sqrt(np.mean(rows[reference, 5]**2))), 4)
+                  if np.any(reference) else None,
+                  reference_jerk_p95_mps3=round(float(np.percentile(rows[reference, 5], 95)), 4)
+                  if np.any(reference) else None)
+    # Central differences use only consecutive free-flight samples.
+    x, y = positions.T
+    velocity = (positions[2:]-positions[:-2])/(2.*dt)
+    acceleration = np.diff(positions, n=2, axis=0)/(dt*dt)
+    speed = np.linalg.norm(velocity, axis=1)
+    moving = consecutive[1:] & consecutive[:-1] & (speed > .30)
+    cross = abs(velocity[:, 0]*acceleration[:, 1]-velocity[:, 1]*acceleration[:, 0])
+    curvature = cross/np.maximum(speed, .30)**3
+    for gate in arena.gates:
+        along = ((x > gate.x-1.3) & (x < gate.x) & (y*gate.bypass_middle > 0.)
+                 & (abs(y) > 1.) & (abs(y) < abs(gate.bypass_middle)-1.5))
+        through = ((x > gate.x-1.35) & (x < gate.x+1.2) & (abs(y-gate.bypass_middle) < 1.5))
+        if not np.any(through & (x >= gate.x)):
+            continue
+        pairs = along[1:] & along[:-1] & consecutive
+        dx = np.diff(x)[pairs]
+        result["bypass"][gate.name] = dict(
+            wall_seconds=round(float(np.diff(times)[pairs].sum()), 3) if len(dx) else None,
+            wall_lateral_excess_m=round(float(max(0., abs(dx).sum()-abs(dx.sum()))), 4) if len(dx) else None,
+            passage_min_clearance_m=round(float(rows[through, 3].min()), 4))
+        turning = through[1:-1] & moving
+        for label, side in (("inlet", x[1:-1] < gate.x), ("outlet", x[1:-1] >= gate.x)):
+            values = curvature[turning & side]
+            result["bypass"][gate.name][label+"_curvature_p95_inv_m"] = (
+                round(float(np.percentile(values, 95)), 4) if len(values) else None)
+    return result
+
+
 def run(*, view=False, dashboard=False, check=False, seed=SEED,
         noise=RANGE_NOISE_M, mode=MODE, trace=None, summary_file=None,
-        force_ramp=PUSH_FORCE_RAMP_N_PER_S, optimize_trajectory=USE_MINIMUM_SNAP):
+        force_ramp=PUSH_FORCE_RAMP_N_PER_S, optimize_trajectory=USE_MINIMUM_SNAP,
+        wall_smoothing=WALL_SMOOTHING):
     arena, fixtures, names = make_scene()
     sim = Simulator(arena, fixtures, seed, noise)
     pose = Localization(arena, ALTITUDE)
     nav = Navigator(arena, effort_weight=EFFORT_WEIGHT_M_PER_J, check=check, mode=mode,
                     show_routes=view and dashboard, force_ramp=force_ramp,
                     smooth_paths=optimize_trajectory)
-    flight = RollingFlight(arena, sim.mass) if optimize_trajectory else None
+    flight = RollingFlight(arena, sim.mass, wall_smoothing=wall_smoothing) if optimize_trajectory else None
+    if flight is not None:
+        def validate_handoff(t, phase, waypoints, revision, leaves, retreat_bypass, alternatives):
+            return flight.try_handoff(t, p, pose.velocity[:2], measured_acceleration, revision,
+                                      waypoints, phase, leaves, retreat_bypass=retreat_bypass,
+                                      alternatives=alternatives)
+
+        nav.flight_handoff = validate_handoff
     trajectory_errors = []
+    quality_samples = []
+    planning_ms = []
     free_clearance = float("inf")
     motor_peak = 0.
     motor_saturation_steps = 0
@@ -126,7 +186,9 @@ def run(*, view=False, dashboard=False, check=False, seed=SEED,
                     reason = "localization_or_flight_envelope"
                     break
                 preceding_phase = nav.phase
+                measured_acceleration = (pose.rotation @ acc)[:2]
                 fly_through = (flight.can_pass(t, nav.path[0]) if flight is not None and nav.path else False)
+                planning_started = perf_counter()
                 target = nav.decide(p, pose.velocity[:2], points, reaction, t,
                                     planar_command=motion[:2],
                                     output_limited=limited_steps >= SCAN_STEPS//2, fly_through=fly_through)
@@ -135,27 +197,42 @@ def run(*, view=False, dashboard=False, check=False, seed=SEED,
                         and nav.phase in ("release", "retreat")):
                     unloading_started, contact_command = t, motion[:2].copy()
                 clearance = None
-                if nav.phase in ("fly", "approach", "cross", "bypass"):
-                    clearance = _measured_clearance(sim, obstacle_ids)
-                    free_clearance = min(free_clearance, clearance)
+                measure_clearance = nav.phase in ("fly", "approach", "cross", "bypass")
                 if flight is not None:
-                    leaves = dict(nav.panels)
-                    if nav.attempt is not None:
-                        leaves[nav.active] = (nav.attempt.leaf,)
-                    measured_acceleration = (pose.rotation @ acc)[:2]
+                    leaves = nav.flight_leaves(nav.phase)
                     separating = (nav.attempt is not None and nav.phase in ("release", "retreat")
                                   and nav.path and (
                                       segment_clear(p, nav.path[0], nav.attempt.leaf, separating=True)
                                       or segment_clear(p, nav.path[0], nav.attempt.leaf)))
+                    retreat_bypass = (nav.phase == "bypass"
+                                      and nav.retreat_bypass_revision == nav.path_revision)
+                    bypass_outlet = ((nav.crossing_left-1, nav.gates[nav.pending])
+                                     if nav.phase == "bypass" and nav.crossing_left else None)
+                    release_alternatives = nav.release_alternatives(p) if flight.active is None else ()
                     flight.update(t, p, pose.velocity[:2], measured_acceleration,
                                   nav.path_revision, nav.path, nav.phase,
-                                  (leaf for name in sorted(leaves) for leaf in leaves[name]),
-                                  separating=separating)
+                                  leaves,
+                                  separating=separating, retreat_bypass=retreat_bypass,
+                                  bypass_outlet=bypass_outlet, release_alternatives=release_alternatives)
+                    if bypass_outlet is not None or release_alternatives:
+                        target = nav.target = nav.path[0]
                     if flight.failure_cause == "corridor" and flight.mode in ("holding", "braking"):
-                        target = nav.repair_door_path(p)
+                        target = nav.repair_door_path(p, t)
+                planning_ms.append((perf_counter()-planning_started)*1000.)
+                if flight is not None:
                     reference = flight.reference(t)
                     if reference is not None and flight.active is not None:
                         trajectory_errors.append(float(np.linalg.norm(p-reference[0])))
+                else:
+                    reference = None
+                if measure_clearance:
+                    clearance = _measured_clearance(sim, obstacle_ids)
+                    free_clearance = min(free_clearance, clearance)
+                    truth = sim.imu.xpos[:2]
+                    tracking = (float(np.linalg.norm(truth-reference[0])) if reference is not None
+                                and flight.active is not None else float("nan"))
+                    jerk = float(np.linalg.norm(reference[3])) if np.isfinite(tracking) else float("nan")
+                    quality_samples.append((t, *truth, clearance, tracking, jerk))
                 if nav.phase in ("release", "cross") and nav.phase != preceding_phase:
                     passage_started = t
                 attempt = nav.attempt
@@ -262,7 +339,9 @@ def run(*, view=False, dashboard=False, check=False, seed=SEED,
                       passage_contact_by_door=dict(passage_contact),
                       last_passage_contact_after_switch_s=passage_contact_last,
                       optimize_trajectory=optimize_trajectory,
+                      wall_smoothing=bool(optimize_trajectory and wall_smoothing),
                       trajectory=flight.diagnostics() if flight else None,
+                      trajectory_quality=_trajectory_quality(quality_samples, planning_ms, arena),
                       tracking_p95_m=round(float(np.percentile(trajectory_errors, 95)), 4)
                       if trajectory_errors else None,
                       free_flight_min_clearance_m=round(free_clearance, 4) if np.isfinite(free_clearance) else None,

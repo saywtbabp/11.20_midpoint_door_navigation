@@ -143,6 +143,8 @@ class Navigator:
         self.panels = {}
         self.disabled = set()
         self.compared = set()
+        self.precontact_rechecked = set()
+        self.flight_handoff = None
         self.finished = set()
         self.events = []
         self.metrics = None
@@ -158,6 +160,7 @@ class Navigator:
         self.pending = None
         self.path = []
         self.path_revision = 0
+        self.retreat_bypass_revision = None
         self.crossing_left = None
         self.target = arena.start.copy()
         self.last_search = -1.
@@ -373,8 +376,31 @@ class Navigator:
             return
         self.phase, self.pending = "fly", None
 
-    def _crossing_path(self, edge, prefix=(), *, position=None):
+    def flight_leaves(self, phase):
+        leaves = dict(self.panels)
+        if self.attempt is not None and phase != "approach":
+            leaves[self.active] = (self.attempt.leaf,)
+        return tuple(leaf for name in sorted(leaves) for leaf in leaves[name])
+
+    def _can_handoff(self, t, phase, points, *, retreat_bypass=False, position=None, alternatives=()):
+        if self.flight_handoff is None:
+            return True
+        leaves = self.flight_leaves(phase)
+        if (phase == "release" and position is not None and self.attempt is not None
+                and not certify_controls(position.reshape(1, 2), self.arena, leaves, margin=FLIGHT_MARGIN)):
+            # Contact needs a separating motion before a free-flight corridor can start.
+            target = np.asarray(points[0])
+            other_leaves = tuple(leaf for leaf in leaves if leaf.gate.name != self.active)
+            return (segment_clear(position, target, self.attempt.leaf, separating=True)
+                    and certify_controls(np.asarray((position, target)), self.arena,
+                                         other_leaves, margin=FLIGHT_MARGIN))
+        return self.flight_handoff(t, phase, points, self.path_revision+1, leaves,
+                                   retreat_bypass, alternatives)
+
+    def _crossing_path(self, edge, prefix=(), *, position=None, handoff_time=None, retreat_bypass=False,
+                       other_prefixes=()):
         points = (*prefix, *edge.waypoints)
+        alternatives = tuple((*other, *edge.waypoints) for other in other_prefixes)
         suffix = ()
         if self.smooth_paths:
             for current, following in zip(self.route_edges, self.route_edges[1:]):
@@ -382,21 +408,51 @@ class Navigator:
                     suffix = following.waypoints
                     break
         if edge.action == "release":
+            original = points
             points = self._smooth_departure(points, suffix, position)
-        elif edge.action == "bypass" and position is not None and len(prefix) == 2 and suffix:
-            points = self._smooth_bypass(points, suffix, position, self.gates[edge.opening_id])
-        return self._target_path(edge.action, points, edge.opening_id, after_crossing=suffix)
+            if len(points) != len(original) or any(dist(a, b) > .015 for a, b in zip(points, original)):
+                alternatives = (original,)
+        elif edge.action == "cross" and position is not None:
+            gate = self.gates[edge.opening_id]
+            for offset in (-.52, .42):
+                entry = (gate.x+offset, gate.middle)
+                if entry[0] > position[0]+.20:
+                    alternatives += ((entry, *edge.waypoints),)
+        elif edge.action == "bypass" and position is not None and len(prefix) in (1, 2) and suffix:
+            variants = [path for candidate in (points, *alternatives)
+                        for path in self._bypass_paths(candidate, suffix, position, self.gates[edge.opening_id])]
+            if retreat_bypass:
+                points, *alternatives = variants
+            else:
+                alternatives = tuple(variants[:-1])
+        route = [*points, *suffix]
+        if handoff_time is not None and not self._can_handoff(
+                handoff_time, edge.action, route, retreat_bypass=retreat_bypass, position=position,
+                alternatives=tuple((*candidate, *suffix) for candidate in alternatives)):
+            return None
+        return self._target_path(edge.action, route[:len(route)-len(suffix)], edge.opening_id,
+                                 after_crossing=suffix)
 
-    def _join_visible_door(self, position, velocity, gate, t):
+    def _join_visible_door(self, position, velocity, gate, t, *, allow_bypass=False):
         if self.phase != "fly" or len(self.path) != 1 or len(self.route_edges) < 2:
             return None
         approach, action = self.route_edges[:2]
-        if (approach.action != "fly" or action.opening_id != gate.name
-                or dist(self.path[0], approach.waypoints[0]) >= .015):
+        if approach.action != "fly" or action.opening_id != gate.name:
             return None
         leaves = tuple(leaf for hypotheses in self.panels.values() for leaf in hypotheses)
-        if action.action == "push" and len(self.panels[gate.name]) == 1:
+        if action.action == "bypass" and allow_bypass:
+            points = np.asarray((position, *approach.waypoints, *action.waypoints))
+            legs = np.stack((points[:-1], points[1:]), axis=1)
+            if certify_controls(legs, self.arena, leaves, margin=FLIGHT_MARGIN):
+                return self._crossing_path(action, approach.waypoints, position=position, handoff_time=t)
+        if dist(self.path[0], approach.waypoints[0]) >= .015:
+            return None
+        if action.action == "push":
             staging = np.asarray(action.waypoints[0])
+            # An ambiguous closed door can still have one usable staging point.
+            if any(dist(staging, leaf.midpoint-.48*leaf.tangent) > .065
+                   for leaf in self.panels[gate.name]):
+                return None
             heading = staging-position
             distance = np.linalg.norm(heading)
             speed = np.linalg.norm(velocity)
@@ -404,19 +460,40 @@ class Navigator:
                 return None
             if certify_controls(np.asarray((position, staging)), self.arena, leaves,
                                 margin=FLIGHT_MARGIN):
-                return self._start_approach(action, t)
+                return self._start_approach(action, t, position, velocity)
         if action.action != "cross":
             return None
         # Aim for the opening itself when the diagonal has enough space.
         # Keep the conservative entry waypoint as a fallback.
         exit_point = np.asarray(action.waypoints[0])
-        for entry in ((gate.x+.42, gate.middle), (gate.x-.52, gate.middle)):
+        prefixes = []
+        for entry in ((gate.x+.42, gate.middle), (gate.x-.52, gate.middle), self.path[0]):
             legs = np.asarray(((position, entry), (entry, exit_point)))
             if certify_controls(legs, self.arena, leaves, margin=FLIGHT_MARGIN):
-                return self._crossing_path(action, (entry,))
-        return self._crossing_path(action, self.path)
+                prefixes.append((entry,))
+        if not prefixes:
+            return self._crossing_path(action, self.path, handoff_time=t)
+        return self._crossing_path(action, prefixes[0], handoff_time=t, other_prefixes=prefixes[1:])
 
-    def _start_approach(self, edge, t):
+    @staticmethod
+    def _lead_paths(position, velocity, target):
+        delta = np.asarray(target)-position
+        length = np.linalg.norm(delta)
+        speed = np.linalg.norm(velocity)
+        if length < .90 or speed < .30:
+            return ()
+        along = delta/length
+        sideways = velocity-(velocity @ along)*along
+        if np.linalg.norm(sideways) < .15:
+            return ()
+        origin = position + min(.75, .35*length)*along
+        return tuple((origin + seconds*sideways, target) for seconds in (.25, .55))
+
+    def _start_approach(self, edge, t, position, velocity):
+        route = list(edge.waypoints)
+        alternatives = self._lead_paths(position, velocity, route[-1])
+        if not self._can_handoff(t, "approach", route, alternatives=alternatives):
+            return None
         leaf = min(self.panels[edge.opening_id], key=lambda item:
                    dist(item.midpoint-.48*item.tangent, edge.waypoints[0]))
         self.active = edge.opening_id
@@ -424,20 +501,23 @@ class Navigator:
         self.last_search = t
         self.event(t, "push", self.active, angle_deg=np.rad2deg(leaf.angle),
                    hinge_options=len(self.panels[self.active]), midpoint=.5)
-        return self._target_path("approach", edge.waypoints, self.active)
+        return self._target_path("approach", route, self.active)
 
-    def _smooth_bypass(self, points, suffix, position, gate):
-        turn, entry, _ = map(np.asarray, points)
-        # Bring the entry toward the incoming lane, then use a single exit
-        # just beyond the jamb plane to join the outbound diagonal.
-        entry = entry + (.18, np.clip(turn[1]-entry[1], -.28, .28))
-        exit_point = np.array((gate.x+.42, gate.bypass_middle))
-        path = np.asarray((position, turn, entry, exit_point, suffix[0]))
-        legs = np.stack((path[:-1], path[1:]), axis=1)
-        leaves = tuple(leaf for hypotheses in self.panels.values() for leaf in hypotheses)
-        if certify_controls(legs, self.arena, leaves, margin=FLIGHT_MARGIN):
-            return (turn, entry, exit_point)
-        return points
+    def _bypass_paths(self, points, suffix, position, gate):
+        entry = np.asarray(points[-2])
+        prefix = points[:-2]
+        turn = prefix[-1] if prefix else position
+        # Start turning before the jamb and bias the exit toward the outgoing leg.
+        exit_side = np.sign(suffix[0][1]-gate.bypass_middle)
+        leaves = self.flight_leaves("bypass")
+        for advance, lead, exit_x, exit_y in ((.40, .65, .52, .07), (.18, .28, .42, 0.)):
+            lead_in = entry + (advance, np.clip(turn[1]-entry[1], -lead, lead))
+            exit_point = np.array((gate.x+exit_x, gate.bypass_middle+exit_y*exit_side))
+            path = np.asarray((position, *prefix, lead_in, exit_point, suffix[0]))
+            legs = np.stack((path[:-1], path[1:]), axis=1)
+            if certify_controls(legs, self.arena, leaves, margin=FLIGHT_MARGIN):
+                yield (*prefix, lead_in, exit_point)
+        yield points
 
     def _smooth_departure(self, points, suffix, position):
         # Keep the separating leg. Once clear of the leaf, try joining the
@@ -479,6 +559,20 @@ class Navigator:
                     return (lead, join) if fraction else (lead,)
         return points
 
+    def release_alternatives(self, position):
+        """Generate small post-separation adjustments without changing the route endpoint."""
+        if self.phase != "release" or not self.crossing_left or len(self.path) < 2:
+            return ()
+        entry = self.path[0]
+        direction = self.path[1]-entry
+        length = np.linalg.norm(direction)
+        if length < .4 or np.linalg.norm(entry-position) < .18:
+            return ()
+        along = direction/length
+        sideways = np.array((-along[1], along[0]))
+        return tuple((entry+forward*along+lateral*sideways, *self.path[1:])
+                     for forward, lateral in ((.15, 0.), (.25, .10), (.25, -.10)))
+
     def _stop(self, position, t, why):
         attempt = self.attempt
         resistance = attempt.measured_force if self.trial is not None else attempt.force
@@ -517,6 +611,7 @@ class Navigator:
         turn = anchor + min(.30, .45*approach_length)*approach/approach_length
         if onward_length > .12:
             turn += min(.30, .45*onward_length)*onward/onward_length
+        prefixes = []
         for corner in (turn, anchor):
             # Cutting the corner is optional. Certify the incoming and outgoing
             # legs against the current leaf and wall surfaces before committing.
@@ -524,10 +619,16 @@ class Navigator:
             points = np.asarray((position, *prefix, *bypass.waypoints))
             legs = np.stack((points[:-1], points[1:]), axis=1)
             if certify_controls(legs, self.arena, obstacles, margin=FLIGHT_MARGIN):
-                self.panels[self.active] = leaves[self.active]
-                self.attempt = self.active = None
-                return self._crossing_path(bypass, prefix, position=position)
-        return None
+                prefixes.append(prefix)
+        if not prefixes:
+            return None
+        target = self._crossing_path(bypass, prefixes[0], position=position, handoff_time=t,
+                                     retreat_bypass=True, other_prefixes=prefixes[1:])
+        if target is not None:
+            self.panels[self.active] = leaves[self.active]
+            self.attempt = self.active = None
+            self.retreat_bypass_revision = self.path_revision
+        return target
 
     def _start_trial(self, t, planar_command):
         force = self.attempt.measured_force
@@ -549,14 +650,17 @@ class Navigator:
         self.trial = None
 
     def _release(self, edge, t, position):
+        target = self._crossing_path(edge, position=position, handoff_time=t)
+        if target is None:
+            return self._stop(position, t, "release_path_unavailable")
         if self.trial is not None:
             self._finish_trial(t, "progress")
         attempt = self.attempt
         self.event(t, "release", self.active, angle_deg=np.rad2deg(attempt.leaf.angle),
                    source=attempt.source)
-        return self._crossing_path(edge, position=position)
+        return target
 
-    def repair_door_path(self, position):
+    def repair_door_path(self, position, t):
         """Change a blocked door approach or departure using the current leaf."""
         if self.phase == "release" and self.attempt is not None and self.attempt.source != "held angle":
             finish = np.asarray(self.nodes[self.active+":door:R"])
@@ -566,7 +670,8 @@ class Navigator:
                 path = self._smooth_departure(path, suffix, position)
                 if len(path)+len(suffix) != len(self.path) or any(
                         dist(a, b) > .06 for a, b in zip(path, self.path)):
-                    return self._target_path("release", path, self.active, after_crossing=suffix)
+                    if self._can_handoff(t, "release", (*path, *suffix), position=position):
+                        return self._target_path("release", path, self.active, after_crossing=suffix)
         if self.phase == "cross" and self.pending is not None:
             gate = self.gates[self.pending]
             leaves = self.panels.get(gate.name, ())
@@ -594,6 +699,18 @@ class Navigator:
                     joined = self._join_visible_door(position, velocity, near_gate, t)
                     if joined is not None:
                         return joined
+            elif (readings and self.active is None and self.smooth_paths
+                  and self.phase == "fly" and len(self.path) == 1
+                  and near_gate.name not in self.precontact_rechecked
+                  and dist(self.path[0], self.nodes[near_gate.name+":door:L"]) < .015
+                  and dist(position, self.path[0]) <= max(1., np.linalg.norm(velocity) + .25)):
+                # Re-evaluate the approach while the previous trajectory still
+                # has room to turn or stop short of its door-front endpoint.
+                self.precontact_rechecked.add(near_gate.name)
+                self.search(position, t, near_gate)
+                joined = self._join_visible_door(position, velocity, near_gate, t, allow_bypass=True)
+                if joined is not None:
+                    return joined
         if self.smooth_paths and self.phase == "release" and readings and near_gate.name == self.active:
             self.attempt.observe(position, readings, reaction, t, update_forecast=False)
         if self.path:
@@ -602,7 +719,8 @@ class Navigator:
                 if joined is not None:
                     return joined
             speed = np.linalg.norm(velocity)
-            threshold = .065 if self.phase in ("release", "approach") else .12
+            tight_target = self.phase == "release" or (self.phase == "approach" and len(self.path) == 1)
+            threshold = .065 if tight_target else .12
             flying_through = fly_through and len(self.path) > 1
             settle_speed = .12 if self.smooth_paths and self.phase == "approach" else .23
             if dist(position, self.path[0]) > threshold or (speed > settle_speed and not flying_through):
@@ -661,13 +779,24 @@ class Navigator:
             self.event(t, "unobserved", edge.opening_id)
             return position
         if edge.action == "push":
-            return self._start_approach(edge, t)
+            target = self._start_approach(edge, t, position, velocity)
+            return target if target is not None else position
         if self.smooth_paths and edge.action == "fly" and len(self.route_edges) > 1:
             first, following = self.route_edges[:2]
             if edge is first and following.action in ("cross", "bypass"):
-                return self._crossing_path(following, edge.waypoints)
+                target = self._crossing_path(following, edge.waypoints, position=position, handoff_time=t)
+                if target is not None:
+                    return target
         if edge.action in ("cross", "bypass"):
-            return self._crossing_path(edge)
+            target = self._crossing_path(edge, position=position, handoff_time=t)
+            return target if target is not None else position
+        if edge.action == "fly" and self.flight_handoff is not None:
+            route = list(edge.waypoints)
+            alternatives = self._lead_paths(position, velocity, route[-1])
+            if alternatives:
+                if self._can_handoff(t, "fly", route, alternatives=alternatives):
+                    return self._target_path("fly", route, edge.opening_id)
+                return position
         return self._target_path(edge.action, edge.waypoints, edge.opening_id)
 
 
